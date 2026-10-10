@@ -152,6 +152,11 @@ impl Ledger {
         self.offers.retain(|_, o| now < o.expires);
     }
 
+    /// Every request whose offer is still open.
+    pub fn open(&self) -> impl Iterator<Item = &RequestId> {
+        self.offers.iter().filter(|(_, o)| !o.used).map(|(r, _)| r)
+    }
+
     pub fn is_open(&self, request: &RequestId) -> bool {
         self.offers.get(request).is_some_and(|o| !o.used)
     }

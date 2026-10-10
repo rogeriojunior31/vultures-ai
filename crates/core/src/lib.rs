@@ -751,7 +751,11 @@ fn apply(state: &mut State, input: Input, now: Instant) -> Vec<Effect> {
                     .iter()
                     .filter(|q| {
                         let cwd = state.sessions.get(&q.session).and_then(|s| s.cwd.as_ref());
-                        q.session.agent == rule.agent
+                        // A cut card is never ruled, as a new request would not be: its full
+                        // command may go on past what the rule allows.
+                        !q.ask.cut
+                            && q.questions.is_empty()
+                            && q.session.agent == rule.agent
                             && q.tool == rule.tool
                             && q.target == rule.target
                             && cwd == Some(&rule.cwd)
@@ -1078,6 +1082,20 @@ fn on_agent(state: &mut State, update: AgentUpdate, now: Instant) -> Vec<Effect>
     let mut effects = Vec::new();
     away::heard(state, &key, &event);
 
+    // A request id already waiting (a hook reusing one) sends both to the terminal, before any rule
+    // or card: a click aimed at the old card must never answer the new one, and a rule answering
+    // the new one must not leave the old card waiting on a hook already answered.
+    if let AgentEvent::PermissionRequested { request, .. } | AgentEvent::QuestionAsked { request, .. } =
+        &event
+        && let Some(old) = take_pending(state, |p| &p.request == request)
+    {
+        record_end(state, &old, Outcome::Released);
+        effects.push(audited(state, &old, audit::Actor::System, audit::Act::Release));
+        effects.push(Effect::ReleasePermission(request.clone()));
+        // Nothing else of this event counts: it is a request we just refused to show.
+        return effects;
+    }
+
     // A later event from the agent that asked means its terminal moved on (the user answered
     // there). Only that agent's: a subagent working in parallel says nothing about it. A tool
     // that finished settles only its own card: a parallel call may still wait for its answer.
@@ -1203,7 +1221,7 @@ fn on_agent(state: &mut State, update: AgentUpdate, now: Instant) -> Vec<Effect>
             } else {
                 session.status = Status::Approval;
                 effects.push(Effect::AckPermission(request.clone()));
-                let more = enqueue(
+                enqueue(
                     state,
                     Pending {
                         request,
@@ -1217,7 +1235,6 @@ fn on_agent(state: &mut State, update: AgentUpdate, now: Instant) -> Vec<Effect>
                         reminders: 0,
                     },
                 );
-                effects.extend(more);
             }
         }
         AgentEvent::QuestionAsked {
@@ -1232,7 +1249,7 @@ fn on_agent(state: &mut State, update: AgentUpdate, now: Instant) -> Vec<Effect>
                 return effects;
             }
             effects.push(Effect::AckPermission(request.clone()));
-            let more = enqueue(
+            enqueue(
                 state,
                 Pending {
                     request,
@@ -1246,7 +1263,6 @@ fn on_agent(state: &mut State, update: AgentUpdate, now: Instant) -> Vec<Effect>
                     reminders: 0,
                 },
             );
-            effects.extend(more);
         }
         AgentEvent::Question { message } => {
             session.status = Status::Question;
@@ -1354,22 +1370,12 @@ pub(crate) fn shows(s: &Session, p: &Pending) -> bool {
 }
 
 /// A card goes on the line, and its offer into the ledger: answerable until the hook stops waiting.
-/// A request id already waiting (a hook reusing one) sends both to the terminal: a click aimed at
-/// the old card must never answer the new one.
-#[must_use]
-fn enqueue(state: &mut State, p: Pending) -> Vec<Effect> {
-    if let Some(old) = take_pending(state, |q| q.request == p.request) {
-        record_end(state, &old, Outcome::Released);
-        return vec![
-            audited(state, &old, audit::Actor::System, audit::Act::Release),
-            Effect::ReleasePermission(p.request),
-        ];
-    }
+/// (A reused request id never gets here: `on_agent` sends it to the terminal first.)
+fn enqueue(state: &mut State, p: Pending) {
     state
         .ledger
         .offer(p.request.clone(), ledger::Binding::of(&p), p.since, PENDING_TTL);
     state.pending.push_back(p);
-    Vec::new()
 }
 
 /// Takes a card off the line, whatever ended it; its offer goes with it.
